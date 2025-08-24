@@ -1,0 +1,105 @@
+{
+  "categories": [
+    { "key": "world", "label": "World", "emoji": "", "order": 1 },
+    { "key": "dutch", "label": "NL", "emoji": "", "order": 2 },
+    { "key": "ai", "label": "AI", "emoji": "", "order": 3 },
+    { "key": "sec", "label": "Security", "emoji": "", "order": 4 },
+    { "key": "movies", "label": "Movies", "emoji": "", "order": 5 },
+    { "key": "weird", "label": "Weird", "emoji": "" ,"order":6 }
+
+  ],
+  "feeds": {
+    "world": [
+      "https://feeds.bbci.co.uk/news/world/rss.xml",
+      "https://rss.cnn.com/rss/edition_world.rss",
+      "https://www.theguardian.com/world/rss",
+      "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+      "https://www.aljazeera.com/xml/rss/all.xml",
+      "https://feeds.npr.org/1004/rss.xml",
+      "https://www.dw.com/en/top-stories/s-9097?maca=en-rss-en-all-1573-rdf",
+      "https://www.euronews.com/rss?level=theme&name=world",
+      "https://www.ft.com/rss/home/uk",
+      "https://www.economist.com/international/rss.xml"
+    ],
+    "dutch": [
+      "https://feeds.nos.nl/nosnieuwsalgemeen",
+      "https://www.nu.nl/rss/Algemeen",
+      "https://www.ad.nl/rss.xml",
+      "https://www.trouw.nl/voorpagina/rss.xml",
+      "https://www.volkskrant.nl/voorpagina/rss.xml",
+      "https://www.parool.nl/voorpagina/rss.xml",
+      "https://www.nrc.nl/rss/",
+      "https://www.rtlnieuws.nl/service/rss/alle-nieuws",
+      "https://www.telegraaf.nl/rss",
+"https://feeds.nos.nl/nosnieuwsbinnenland",
+"https://feeds.nos.nl/nosnieuwsbuitenland",
+"https://feeds.nos.nl/nosnieuwsopmerkelijk",
+"https://www.rijnmond.nl/rss/index.xml",
+"http://www.nd.nl/rss/nieuws",
+"https://www.ad.nl/dordrecht/rss.xml",
+"https://www.ad.nl/rotterdam/rss.xml",
+"https://www.ad.nl/wetenschap/rss.xml",
+"http://www.refdag.nl/rss/laatste+nieuws.rss",
+      "https://fd.nl/?rss"
+    ],
+    "ai": [
+      "https://ai.googleblog.com/atom.xml",
+      "https://deepmind.com/blog/feed/basic",
+      "https://openai.com/feed.xml?format=xml",
+      "https://huggingface.co/blog/feed.xml",
+      "https://www.microsoft.com/en-us/research/feed/",
+      "https://www.technologyreview.com/topic/artificial-intelligence/feed/",
+      "https://venturebeat.com/category/ai/feed/",
+      "https://www.semianalysis.com/feed",
+      "https://www.thegradient.pub/rss/",
+      "https://www.anthropic.com/news.xml"
+    ],
+    "sec": [
+      "https://krebsonsecurity.com/feed/",
+      "https://feeds.feedburner.com/TheHackersNews",
+      "https://www.bleepingcomputer.com/feed/",
+      "https://threatpost.com/feed/",
+      "https://www.darkreading.com/rss.xml",
+      "https://www.schneier.com/blog/atom.xml",
+      "https://isc.sans.edu/rssfeed_full.xml",
+      "https://www.cisa.gov/cybersecurity-advisories/all.xml",
+      "https://security.googleblog.com/feeds/posts/default",
+"http://feeds.feedburner.com/computeridee_nieuws",
+"http://feeds2.feedburner.com/ComputerTotaal",
+"https://feeds.nos.nl/nosnieuwstech",
+"https://www.ad.nl/digitaal/rss.xml",
+      "https://www.microsoft.com/en-us/security/blog/feed/"
+    ],
+    "movies": [
+      "http://variety.com/feed/",
+      "https://www.hollywoodreporter.com/c/movies/feed/",
+      "https://www.indiewire.com/c/film/feed/",
+      "https://www.slashfilm.com/feed/",
+      "https://theplaylist.net/feed/",
+      "https://thefilmstage.com/feed/",
+      "https://www.firstshowing.net/feed/",
+      "https://www.empireonline.com/feeds/all/",
+      "https://www.thewrap.com/feed/"
+    ],
+    "weird": [
+      "https://www.speld.nl/feed",
+      "https://weird-facts.org/rss",
+      "https://rss.upi.com/news/odd_news.rss",
+      "https://thedailymash.co.uk/feed",
+      "https://dailysquib.co.uk/feed",
+      "https://www.sciencedaily.com/rss/strange_offbeat.xml",
+"https://www.ad.nl/bizar/rss.xml",
+      "https://feeds.feedburner.com/CrackedRSS"
+    ]
+  },
+  "filters": {
+    "maxAgeDays": 7,
+    "blockedCategories": ["Voetbal", "Wielrennen"]
+  },
+  "tzOverrides": {
+    "nos.nl": "Europe/Amsterdam",
+    "nu.nl": "Europe/Amsterdam",
+    "nd.nl": "Europe/Amsterdam",
+    "ad.nl": "Europe/Amsterdam"
+  }  
+}

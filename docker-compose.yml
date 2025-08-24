@@ -1,0 +1,11 @@
+# docker-compose.yml
+services:
+  underwire:
+    build: .
+    image: underwire:latest
+    ports:
+      - "3030:3000"
+    environment:
+      - NODE_ENV=production
+    volumes:
+      - ./public/feeds.json:/app/public/feeds.json:ro
