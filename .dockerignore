@@ -1,0 +1,12 @@
+node_modules
+.next
+data
+.git
+.gitignore
+npm-debug.log*
+Dockerfile*
+docker-compose*.yml
+README.md
+CHANGELOG.md
+TECHNICAL.md
+FUNCTIONAL.md

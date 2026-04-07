@@ -9,3 +9,7 @@ services:
       - NODE_ENV=production
     volumes:
       - ./public/feeds.json:/app/public/feeds.json:ro
+      - underwire-data:/app/data
+
+volumes:
+  underwire-data:
