@@ -49,7 +49,16 @@ export async function GET(req: Request) {
   }
 
   const cacheKey = `${feedUrl.toString()}|${forceLocalTZ || ""}|${limit}`;
-  const cached = getFeedCache(cacheKey);
+  let cached: ReturnType<typeof getFeedCache> = null;
+  let cacheAvailable = true;
+
+  try {
+    cached = getFeedCache(cacheKey);
+  } catch {
+    cacheAvailable = false;
+    cached = null;
+  }
+
   if (!bust && cached && Date.now() - cached.fetched_at < CACHE_TTL_MS) {
     return NextResponse.json(cached.items, {
       headers: {
@@ -146,22 +155,28 @@ export async function GET(req: Request) {
       limit,
     });
 
-    upsertFeedCache({
-      cacheKey,
-      feedUrl: feedUrl.toString(),
-      tzOverride: forceLocalTZ,
-      itemLimit: limit,
-      items,
-      fetchedAt: Date.now(),
-      lastStatus: 200,
-      lastError: null,
-    });
-    pruneFeedCache(CACHE_RETENTION_MS);
+    if (cacheAvailable) {
+      try {
+        upsertFeedCache({
+          cacheKey,
+          feedUrl: feedUrl.toString(),
+          tzOverride: forceLocalTZ,
+          itemLimit: limit,
+          items,
+          fetchedAt: Date.now(),
+          lastStatus: 200,
+          lastError: null,
+        });
+        pruneFeedCache(CACHE_RETENTION_MS);
+      } catch {
+        cacheAvailable = false;
+      }
+    }
 
     return NextResponse.json(items, {
       headers: {
         "cache-control": "no-store",
-        "x-cache": cached ? "SQLITE-REFRESH" : "SQLITE-MISS",
+        "x-cache": !cacheAvailable ? "CACHE-BYPASS" : cached ? "SQLITE-REFRESH" : "SQLITE-MISS",
         ...corsHeaders(),
       },
     });
@@ -173,7 +188,11 @@ export async function GET(req: Request) {
         : "Fetch failed";
 
     if (cached?.items?.length) {
-      updateFeedCacheError(cacheKey, aborted ? 504 : 502, message);
+      if (cacheAvailable) {
+        try {
+          updateFeedCacheError(cacheKey, aborted ? 504 : 502, message);
+        } catch {}
+      }
       return NextResponse.json(cached.items, {
         headers: {
           "cache-control": "no-store",
