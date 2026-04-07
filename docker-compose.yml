@@ -2,7 +2,7 @@
 services:
   underwire:
     build: .
-    image: underwire:latest
+    pull_policy: never
     ports:
       - "3030:3000"
     environment:
