@@ -1,0 +1,8 @@
+{
+  "/_global-error/page": "/_global-error",
+  "/_not-found/page": "/_not-found",
+  "/api/rss/route": "/api/rss",
+  "/feeds/page": "/feeds",
+  "/icon.png/route": "/icon.png",
+  "/page": "/"
+}

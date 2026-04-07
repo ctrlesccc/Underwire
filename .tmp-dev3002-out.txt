@@ -1,0 +1,6 @@
+▲ Next.js 16.2.2 (Turbopack)
+- Local:         http://localhost:3002
+- Network:       http://10.5.0.2:3002
+✓ Ready in 331ms
+Creating turbopack project { dir: 'C:\\Projects\\Underwire', testMode: true }
+

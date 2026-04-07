@@ -1,258 +1,332 @@
 "use client";
 
 import DOMPurify from "isomorphic-dompurify";
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTheme } from "next-themes";
+import Link from "next/link";
 import DetailsSheet from "../components/DetailsSheet";
+import { safeLocalStorageSetItem } from "../lib/browser-storage";
+import { formatAbsoluteTimestamp, timeAgo } from "../lib/date-format";
+import type { FeedItem, FeedsConfig } from "../lib/feed";
+import { getBadFeeds, getEnabledFeeds, logFeedHttpError } from "../lib/feed-preferences";
 
-// ---------- runtime config types ----------
-type FeedsConfig = {
-  categories: { key: string; label: string; emoji: string; order?: number; enabled?: boolean }[];
-  feeds: Record<string, string[]>;
-  filters?: {
-    maxAgeDays?: number;
-    blockedCategories?: string[];
-  };
-  tzOverrides?: Record<string, string>; // e.g. { "nos.nl": "Europe/Amsterdam" }
-};
+const FEED_CONCURRENCY = 6;
+const FEED_ITEM_LIMIT = 20;
+const VIEW_MODE_KEY = "reader:viewMode";
 
-
-// ---------- app types ----------
-type FeedItem = {
-  id: string;
-  title: string;
-  link: string;
-  published?: string;
-  image?: string | null;
-  source: string;
-  description?: string;
-  categories?: string[]; // <-- added
-};
-
-
-
-
-
-// ---- timezone formatting helpers ----
-const TARGET_TZ = "Europe/Amsterdam" as const;   // was "Europe/Amsterdam"
-
-
-const DEFAULT_LOCALE = "nl-NL" as const;
-const DEFAULT_TZ = "Europe/Amsterdam" as const; // was "Europe/Amsterdam"
-
-function formatInTZ(iso?: string, opts?: Intl.DateTimeFormatOptions) {
-  if (!iso) return "";
-  const d = new Date(iso);
-  if (!Number.isFinite(d.getTime())) return "";
-
-  // Start with base; allow caller to override timeZone via opts.timeZone
-  const tz = (opts && opts.timeZone) || DEFAULT_TZ;
-
-  // Build options imperatively to keep TS happy
-  const finalOpts: Intl.DateTimeFormatOptions = { timeZone: tz, hour12: false };
-
-  const hasSpecific =
-    !!opts &&
-    (opts.year !== undefined || opts.month !== undefined || opts.day !== undefined ||
-     opts.hour !== undefined || opts.minute !== undefined || opts.second !== undefined ||
-     opts.timeZoneName !== undefined || opts.timeZone !== undefined);
-
-  if (hasSpecific) {
-    Object.assign(finalOpts, opts);
-
-    // Avoid runtime error: timeZoneName can't be combined with dateStyle/timeStyle
-    if (finalOpts.timeZoneName && (finalOpts.dateStyle || finalOpts.timeStyle)) {
-      delete (finalOpts as any).dateStyle;
-      delete (finalOpts as any).timeStyle;
-    }
-  } else {
-    finalOpts.dateStyle = "short";
-    finalOpts.timeStyle = "medium";
-  }
-
-  return d.toLocaleString(DEFAULT_LOCALE, finalOpts);
-}
-
-
-type FeedErrorLog = Record<
-  string,
-  { counts: Record<number, number>; last: number }
->;
-
-const FEED_ERR_KEY = "uw-feedErrors";
-
-function logFeedHttpError(url: string, status: number) {
-  try {
-    if (typeof window === "undefined") return;
-    if (status !== 404 && status !== 502) return; // only track 404/502
-
-    const raw = localStorage.getItem(FEED_ERR_KEY);
-    const data: FeedErrorLog = raw ? JSON.parse(raw) : {};
-
-    const entry = data[url] || { counts: {}, last: 0 };
-    entry.counts[status] = (entry.counts[status] || 0) + 1;
-    entry.last = Date.now();
-    data[url] = entry;
-
-    localStorage.setItem(FEED_ERR_KEY, JSON.stringify(data));
-  } catch {}
-}
-
-function getBadFeeds(threshold = 1) {
-  // threshold = min total 404+502 sightings to consider “bad”
-  try {
-    const raw = localStorage.getItem(FEED_ERR_KEY);
-    if (!raw) return [];
-    const data: FeedErrorLog = JSON.parse(raw);
-    return Object.entries(data)
-      .map(([url, v]) => ({
-        url,
-        "404": v.counts[404] || 0,
-        "501": v.counts[501] || 0,
-        "502": v.counts[502] || 0,
-        "503": v.counts[502] || 0,
-        "504": v.counts[502] || 0,
-        total: (v.counts[404] || 0) + (v.counts[501] || 0)+ (v.counts[502] || 0)+ (v.counts[503] || 0)+ (v.counts[504] || 0),
-        lastSeen: new Date(v.last).toISOString(),
-      }))
-      .filter((r) => r.total >= threshold)
-      .sort((a, b) => b.total - a.total || a.url.localeCompare(b.url));
-  } catch {
-    return [];
-  }
-}
-
-function clearBadFeedLog() {
-  try {
-    localStorage.removeItem(FEED_ERR_KEY);
-  } catch {}
-}
-
-// Get the timezone offset (in minutes) for a given IANA zone at a given UTC instant.
-function tzOffsetMinutesAt(date: Date, timeZone: string): number {
-  // Format the UTC instant in the target zone, then rebuild a UTC timestamp from those parts.
-  const dtf = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    hour12: false,
-    year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit",
-  });
-  const parts = dtf.formatToParts(date);
-  const data: Record<string, string> = {};
-  for (const p of parts) if (p.type !== "literal") data[p.type] = p.value;
-  const asUTC = Date.UTC(
-    Number(data.year),
-    Number(data.month) - 1,
-    Number(data.day),
-    Number(data.hour),
-    Number(data.minute),
-    Number(data.second || "0")
-  );
-  // Positive result means zone is ahead of UTC (e.g., CEST = +120)
-  return Math.round((asUTC - date.getTime()) / 60000);
-}
-
-/**
- * Treat an ISO moment as if its *wall time* belongs to `timeZone`.
- * Example: "2025-08-19T18:55:00Z" + Europe/Amsterdam (UTC+2) -> "2025-08-19T16:55:00Z"
- * Use ONLY for mislabelled feeds that stuck "Z" on local times.
- */
-function coerceIsoAssumingLocalZone(iso: string, timeZone: string): string {
-  const d = new Date(iso);
-  if (!Number.isFinite(d.getTime())) return iso;
-  const offMin = tzOffsetMinutesAt(d, timeZone);
-  const corrected = new Date(d.getTime() - offMin * 60_000);
-  return corrected.toISOString();
-}
-
-// Find override TZ for a feed URL using config.tzOverrides (key match by substring)
-function resolveTzOverride(feedUrl: string, cfg?: FeedsConfig | null): string | null {
-  const map = cfg?.tzOverrides;
-  if (!map) return null;
-  for (const key of Object.keys(map)) {
-    if (feedUrl.includes(key)) return map[key];
-  }
-  return null;
-}
-
-
-
-// Handy preset when you want the TZ in the tooltip:
-function formatInTZWithTZName(iso?: string) {
-  return formatInTZ(iso, {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    timeZoneName: "short",
-  });
-}
-
-
-
-// ---------- helpers ----------
-const fifteenMinutes = 15 * 60 * 1000;
+type ViewMode = "grid4" | "list" | "frontpage";
 
 function domainFromURL(url: string) {
   try {
-    const u = new URL(url);
-    return u.hostname.replace(/^www\./, "");
+    const parsed = new URL(url);
+    return parsed.hostname.replace(/^www\./, "");
   } catch {
     return url;
   }
 }
 
-function cacheKey(feedUrl: string) {
-  return `rsscache:${feedUrl}`;
+function normalizeTitle(title: string) {
+  return title
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-function extractFirstImg(el: Element): string | null {
-  const candidates = ["content:encoded", "content", "description", "summary"];
-  for (const tag of candidates) {
-    const node = el.getElementsByTagName(tag)[0];
-    if (!node) continue;
-    const html = node.textContent || "";
-    const m = html.match(/<img[^>]+src=["']([^"']+)["']/i);
-    if (m) return m[1];
+function stripHtml(html?: string | null) {
+  if (!html) return "";
+
+  return html
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function summaryFromItem(item: FeedItem, maxLength = 220) {
+  const text = stripHtml(item.description);
+  if (!text) return "";
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength).trimEnd()}…`;
+}
+
+function NewspaperPreview({
+  item,
+  className,
+  onOpen,
+  summaryLength = 180,
+  titleClassName,
+  imageRatioClassName = "aspect-[16/10]",
+  imageHeightClassName,
+  showImage = true,
+}: {
+  item: FeedItem;
+  className?: string;
+  onOpen: (item: FeedItem) => void;
+  summaryLength?: number;
+  titleClassName?: string;
+  imageRatioClassName?: string;
+  imageHeightClassName?: string;
+  showImage?: boolean;
+}) {
+  const summary = summaryFromItem(item, summaryLength);
+  const hasImage = !isBadImage(item.image);
+
+  return (
+    <button
+      type="button"
+      onClick={() => onOpen(item)}
+      className={`block w-full text-left ${className || ""}`}
+      aria-label={`Open article: ${item.title}`}
+    >
+      <article className="h-full border border-[var(--border)] p-3 md:p-4">
+        {showImage && hasImage && (
+          <div className="mb-3 overflow-hidden border border-[var(--border)]">
+            <div className={`${imageHeightClassName || imageRatioClassName} bg-[var(--background-alt)]`}>
+              <img src={item.image!} alt="" className="h-full w-full object-cover" loading="lazy" />
+            </div>
+          </div>
+        )}
+
+        <div className="font-mono text-[10px] uppercase tracking-[0.18em] muted-text">
+          {domainFromURL(item.link || item.source)}
+        </div>
+        <h3 className={`font-display mt-2 leading-tight ${titleClassName || "text-[1.6rem] md:text-[1.9rem]"}`}>
+          {item.title}
+        </h3>
+        {summary && <p className="mt-3 text-sm leading-6 muted-text">{summary}</p>}
+        <div className="mt-4 flex items-end justify-between gap-3 border-t border-[var(--border)] pt-2 text-[10px]">
+          <span className="font-mono uppercase tracking-[0.16em]">
+            {item.published ? formatAbsoluteTimestamp(item.published) : "Latest edition"}
+          </span>
+          {item.published && <span className="font-mono">{timeAgo(item.published)}</span>}
+        </div>
+      </article>
+    </button>
+  );
+}
+
+function NewspaperFrontPage({
+  items,
+  onOpen,
+}: {
+  items: FeedItem[];
+  onOpen: (item: FeedItem) => void;
+}) {
+  const frontPage = items.slice(0, 30);
+  const lead = frontPage[0];
+  const rightRailTop = frontPage[1];
+  const rightRailBottom = frontPage[2];
+  const bodyStories = frontPage.slice(3);
+
+  if (!lead) return null;
+
+  return (
+    <section className="border border-[var(--border)] bg-[var(--surface)] text-[var(--foreground)]">
+      <div className="grid gap-0 xl:grid-cols-[1.65fr_0.95fr]">
+        <div className="border-b border-r border-[var(--border)] xl:border-b-0">
+          <NewspaperPreview
+            item={lead}
+            onOpen={onOpen}
+            className="h-full"
+            summaryLength={340}
+            titleClassName="text-[2.2rem] md:text-[3.4rem]"
+            imageHeightClassName="h-[20rem] md:h-[32rem]"
+          />
+        </div>
+        <div className="grid border-b border-[var(--border)] xl:border-b-0 xl:grid-rows-2">
+          {rightRailTop && (
+            <div className="border-b border-[var(--border)]">
+              <NewspaperPreview
+                item={rightRailTop}
+                onOpen={onOpen}
+                className="h-full"
+                summaryLength={150}
+                titleClassName="text-[1.6rem] md:text-[2rem]"
+                imageHeightClassName="h-[14rem] md:h-[16rem]"
+              />
+            </div>
+          )}
+          {rightRailBottom && (
+            <div>
+              <NewspaperPreview
+                item={rightRailBottom}
+                onOpen={onOpen}
+                className="h-full"
+                summaryLength={150}
+                titleClassName="text-[1.45rem] md:text-[1.8rem]"
+                imageRatioClassName="aspect-[16/8]"
+              />
+            </div>
+          )}
+        </div>
+      </div>
+
+      {bodyStories.length > 0 && (
+        <div className="border-t border-[var(--border)] px-0 py-0 lg:columns-2 lg:gap-0">
+          {bodyStories.map((item, index) => (
+            (() => {
+              const variant = index % 8;
+              const summaryLength =
+                variant === 0 ? 235 :
+                variant === 1 ? 85 :
+                variant === 2 ? 145 :
+                variant === 3 ? 110 :
+                variant === 4 ? 175 :
+                variant === 5 ? 70 :
+                variant === 6 ? 125 :
+                95;
+              const titleClassName =
+                variant === 0 ? "text-[1.9rem] md:text-[2.55rem]" :
+                variant === 1 ? "text-[1.02rem] md:text-[1.18rem]" :
+                variant === 2 ? "text-[1.3rem] md:text-[1.7rem]" :
+                variant === 3 ? "text-[1.15rem] md:text-[1.35rem]" :
+                variant === 4 ? "text-[1.55rem] md:text-[2rem]" :
+                variant === 5 ? "text-[1rem] md:text-[1.12rem]" :
+                variant === 6 ? "text-[1.22rem] md:text-[1.5rem]" :
+                "text-[1.08rem] md:text-[1.28rem]";
+              const imageHeightClassName =
+                variant === 0 ? "h-[17rem] md:h-[23rem]" :
+                variant === 2 ? "h-[11rem] md:h-[14rem]" :
+                variant === 4 ? "h-[14rem] md:h-[18rem]" :
+                variant === 7 ? "h-[10rem] md:h-[13rem]" :
+                undefined;
+              const imageRatioClassName =
+                variant === 3 ? "aspect-[16/8]" :
+                variant === 6 ? "aspect-[4/5]" :
+                "aspect-[16/10]";
+              const showImage = ![1, 5].includes(variant);
+
+              return (
+                <div
+                  key={item.id}
+                  className={`break-inside-avoid ${index > 0 ? "border-t border-[var(--border)]" : ""}`}
+                >
+                  <NewspaperPreview
+                    item={item}
+                    onOpen={onOpen}
+                    summaryLength={summaryLength}
+                    titleClassName={titleClassName}
+                    imageHeightClassName={imageHeightClassName}
+                    imageRatioClassName={imageRatioClassName}
+                    showImage={showImage}
+                  />
+                </div>
+              );
+            })()
+          ))}
+        </div>
+      )}
+
+    </section>
+  );
+}
+
+function ViewIcon({
+  mode,
+  active,
+}: {
+  mode: ViewMode;
+  active: boolean;
+}) {
+  const stroke = active ? "currentColor" : "currentColor";
+
+  if (mode === "grid4") {
+    return (
+      <svg viewBox="0 0 20 20" aria-hidden="true" className="h-3.5 w-3.5" fill="none" stroke={stroke} strokeWidth="1.5">
+        <rect x="2.5" y="2.5" width="5" height="5" />
+        <rect x="12.5" y="2.5" width="5" height="5" />
+        <rect x="2.5" y="12.5" width="5" height="5" />
+        <rect x="12.5" y="12.5" width="5" height="5" />
+      </svg>
+    );
   }
+
+  if (mode === "frontpage") {
+    return (
+      <svg viewBox="0 0 20 20" aria-hidden="true" className="h-3.5 w-3.5" fill="none" stroke={stroke} strokeWidth="1.5">
+        <rect x="2.5" y="3" width="15" height="14" />
+        <path d="M5 6h7" />
+        <path d="M5 9h7" />
+        <path d="M5 12h4" />
+        <rect x="11.5" y="11" width="3.5" height="3.5" />
+      </svg>
+    );
+  }
+
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true" className="h-3.5 w-3.5" fill="none" stroke={stroke} strokeWidth="1.5">
+      <path d="M3 5.5h14" />
+      <path d="M3 10h14" />
+      <path d="M3 14.5h14" />
+    </svg>
+  );
+}
+
+function ActionIcon({ kind }: { kind: "feeds" | "health" | "refresh" | "theme" }) {
+  if (kind === "feeds") {
+    return (
+      <svg viewBox="0 0 20 20" aria-hidden="true" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.5">
+        <path d="M3 5h14" />
+        <path d="M3 10h14" />
+        <path d="M3 15h14" />
+        <path d="M6 5v10" />
+      </svg>
+    );
+  }
+
+  if (kind === "health") {
+    return (
+      <svg viewBox="0 0 20 20" aria-hidden="true" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.5">
+        <path d="M3 10h3l2-4 3 8 2-4h4" />
+      </svg>
+    );
+  }
+
+  if (kind === "refresh") {
+    return (
+      <svg viewBox="0 0 20 20" aria-hidden="true" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.5">
+        <path d="M16 10a6 6 0 1 1-1.76-4.24" />
+        <path d="M16 4v4h-4" />
+      </svg>
+    );
+  }
+
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.5">
+      <circle cx="10" cy="10" r="3.5" />
+      <path d="M10 2.5v2" />
+      <path d="M10 15.5v2" />
+      <path d="M2.5 10h2" />
+      <path d="M15.5 10h2" />
+      <path d="M4.7 4.7l1.4 1.4" />
+      <path d="M13.9 13.9l1.4 1.4" />
+      <path d="M15.3 4.7l-1.4 1.4" />
+      <path d="M6.1 13.9l-1.4 1.4" />
+    </svg>
+  );
+}
+
+function resolveTzOverride(feedUrl: string, config?: FeedsConfig | null) {
+  const map = config?.tzOverrides;
+  if (!map) return null;
+
+  for (const key of Object.keys(map)) {
+    if (feedUrl.includes(key)) return map[key];
+  }
+
   return null;
-}
-
-function normalizeLink(url: string) {
-  try {
-    const u = new URL(url);
-    const drop = [
-      "utm_source",
-      "utm_medium",
-      "utm_campaign",
-      "utm_term",
-      "utm_content",
-      "ito",
-      "icid",
-      "mc_cid",
-      "mc_eid",
-      "mbid",
-      "cmpid",
-      "smid",
-      "ref",
-      "fbclid",
-      "gclid",
-      "igshid",
-      "xtor",
-    ];
-    drop.forEach((p) => u.searchParams.delete(p));
-    u.hash = "";
-    return u.toString();
-  } catch {
-    return url;
-  }
 }
 
 const sanitizeHtml = (html?: string | null, baseHref?: string): string => {
   if (!html) return "";
   if (typeof window === "undefined") return html;
+
   try {
     const clean = DOMPurify.sanitize(html, {
       USE_PROFILES: { html: true },
@@ -264,17 +338,28 @@ const sanitizeHtml = (html?: string | null, baseHref?: string): string => {
     const container = document.createElement("div");
     container.appendChild(clean);
 
-    container.querySelectorAll("a[href]").forEach((a) => {
-      const href = a.getAttribute("href")!;
+    container.querySelectorAll("a[href]").forEach((anchor) => {
+      const href = anchor.getAttribute("href");
+      if (!href) return;
+
       try {
-        const abs = new URL(
-          href,
-          baseHref || window.location.origin
-        ).toString();
-        a.setAttribute("href", abs);
+        anchor.setAttribute("href", new URL(href, baseHref || window.location.origin).toString());
       } catch {}
-      a.setAttribute("target", "_blank");
-      a.setAttribute("rel", "noopener noreferrer");
+
+      anchor.setAttribute("target", "_blank");
+      anchor.setAttribute("rel", "noopener noreferrer");
+    });
+
+    container.querySelectorAll("img[src]").forEach((img) => {
+      const src = img.getAttribute("src");
+      if (!src) return;
+
+      try {
+        img.setAttribute("src", new URL(src, baseHref || window.location.origin).toString());
+      } catch {}
+
+      img.setAttribute("loading", "lazy");
+      img.setAttribute("decoding", "async");
     });
 
     return container.innerHTML;
@@ -283,211 +368,10 @@ const sanitizeHtml = (html?: string | null, baseHref?: string): string => {
   }
 };
 
-
 function isBadImage(url?: string | null) {
   if (!url) return true;
-  const lower = url.toLowerCase();
-  return /spacer|pixel|blank|\.gif(\?|$)/.test(lower);
+  return /spacer|pixel|blank|\.gif(\?|$)/i.test(url);
 }
-
-function timeAgo(iso?: string) {
-  if (!iso) return "";
-  const t = new Date(iso).getTime();
-  if (!Number.isFinite(t)) return "";
-
-  const now = Date.now();
-  let diff = now - t;               // ms
-  const future = diff < 0;
-  diff = Math.abs(diff);
-
-  const mins = Math.floor(diff / 60_000);
-  const hrs  = Math.floor(diff / 3_600_000);
-  const days = Math.floor(diff / 86_400_000);
-
-  if (mins < 1) return future ? "in <1m" : "just now";
-  if (mins < 60) return future ? `in ${mins}m` : `${mins}m ago`;
-  if (hrs  < 24) return future ? `in ${hrs}h`  : `${hrs}h ago`;
-  return future ? `in ${days}d` : `${days}d ago`;
-}
-
-
-function parseRssDateToISO(input?: string): string | undefined {
-  if (!input) return undefined;
-  let s = input.trim();
-
-  // Drop trailing "(CEST)" etc.
-  s = s.replace(/\s*\([^)]+\)\s*$/, "");
-
-  // Normalize known textual zones before trying native parse.
-
-  // 1) UT/UTC/GMT → +0000
-  if (/\s(?:UT|UTC|GMT)$/i.test(s)) {
-    s = s.replace(/\s(?:UT|UTC|GMT)$/i, " +0000");
-  }
-
-  // 2) Single-letter military zones (RFC 2822). J is unused.
-  const m = s.match(/\s([A-IK-Z])$/i);
-  if (m) {
-    const z = m[1].toUpperCase();
-    const map: Record<string, string> = {
-      Z: "+0000",
-      A: "-0100",
-      B: "-0200",
-      C: "-0300",
-      D: "-0400",
-      E: "-0500",
-      F: "-0600",
-      G: "-0700",
-      H: "-0800",
-      I: "-0900",
-      K: "-1000",
-      L: "-1100",
-      M: "-1200",
-      N: "+0100",
-      O: "+0200",
-      P: "+0300",
-      Q: "+0400",
-      R: "+0500",
-      S: "+0600",
-      T: "+0700",
-      U: "+0800",
-      V: "+0900",
-      W: "+1000",
-      X: "+1100",
-      Y: "+1200",
-    };
-    const off = map[z];
-    if (off) s = s.replace(/\s([A-IK-Z])$/i, " " + off);
-  }
-
-  // 3) (Optional) Common abbreviations seen in feeds
-  // (DST zones are heuristic; improves real-world feeds)
-  s = s.replace(/\s([A-Z]{2,4})$/, (_m, abbr: string) => {
-    const tz = {
-      CET: "+0100",
-      CEST: "+0200",
-      EET: "+0200",
-      EEST: "+0300",
-      GMT: "+0000",
-      WET: "+0000",
-      WEST: "+0100",
-      IST: "+0530", // India; beware Irish summer time ambiguity
-      JST: "+0900",
-      PST: "-0800",
-      PDT: "-0700",
-      MST: "-0700",
-      MDT: "-0600",
-      CST: "-0600",
-      CDT: "-0500",
-      EST: "-0500",
-      EDT: "-0400",
-      AEST: "+1000",
-      AEDT: "+1100",
-      ACST: "+0930",
-      ACDT: "+1030",
-      NZST: "+1200",
-      NZDT: "+1300",
-  
-    } as Record<string, string>;
-    const key = String(abbr).toUpperCase();
-    return tz[key] ? " " + tz[key] : " " + abbr;
-  });
-
-  // 4) Now try native parse
-  let d = new Date(s);
-  if (!Number.isNaN(d.getTime())) return d.toISOString();
-
-  // 5) 'YYYY-MM-DD HH:mm[:ss]' → assume UTC
-  if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?$/.test(s)) {
-    d = new Date(s.replace(" ", "T") + "Z");
-    if (!Number.isNaN(d.getTime())) return d.toISOString();
-  }
-
-  // 6) (Optional) 2-digit year repair (RFC 2822 guidance)
-  // 00–49 → 2000–2049, 50–99 → 1950–1999
-  const y2 = s.replace(
-    /(^|,\s)(\d{1,2}\s+[A-Za-z]{3}\s+)(\d{2})(\s+\d{2}:\d{2}(?::\d{2})?(\s|$))/,
-    (_m, pre, preDate, yy, post) => {
-      const n = parseInt(yy, 10);
-      const full = n >= 50 ? 1900 + n : 2000 + n;
-      return `${pre}${preDate}${full}${post}`;
-    }
-  );
-  if (y2 !== s) {
-    d = new Date(y2);
-    if (!Number.isNaN(d.getTime())) return d.toISOString();
-  }
-
-  return undefined;
-}
-function parseRSS(xml: string, feedUrl: string, forceLocalTZ?: string): FeedItem[] {
-  const doc = new DOMParser().parseFromString(xml, "text/xml");
-  const entries = Array.from(doc.querySelectorAll("entry, item")).slice(0, 50);
-
-  return entries.map((el, i) => {
-    const title = el.querySelector("title")?.textContent?.trim() || "(untitled)";
-
-    let link =
-      (el.querySelector("link[rel='alternate']") as Element | null)?.getAttribute("href") ||
-      el.querySelector("link")?.textContent ||
-      (el.querySelector("link") as Element | null)?.getAttribute("href") || "";
-    link = normalizeLink(link || "");
-
-    const publishedRaw =
-      el.getElementsByTagName("published")[0]?.textContent ||
-      el.getElementsByTagName("updated")[0]?.textContent ||
-      el.getElementsByTagName("pubDate")[0]?.textContent ||
-      el.getElementsByTagName("dc:date")[0]?.textContent ||
-      el.getElementsByTagName("dcterms:created")[0]?.textContent ||
-      el.getElementsByTagName("dcterms:modified")[0]?.textContent ||
-      undefined;
-
-    let publishedISO = parseRssDateToISO(publishedRaw);
-
-    // If the feed is known to have "Z" but actually means local, correct it:
-    if (forceLocalTZ && publishedISO) {
-      publishedISO = coerceIsoAssumingLocalZone(publishedISO, forceLocalTZ);
-    }
-
-    const media =
-      el.getElementsByTagName("media:content")[0]?.getAttribute("url") ||
-      el.getElementsByTagName("media:thumbnail")[0]?.getAttribute("url") ||
-      el.querySelector("enclosure[type^='image/']")?.getAttribute("url") ||
-      (el.getElementsByTagName("itunes:image")[0] as Element | undefined)?.getAttribute("href") ||
-      extractFirstImg(el);
-
-    const rawDesc =
-      el.getElementsByTagName("content:encoded")[0]?.textContent ||
-      el.getElementsByTagName("content")[0]?.textContent ||
-      el.getElementsByTagName("description")[0]?.textContent ||
-      el.getElementsByTagName("summary")[0]?.textContent || "";
-
-    const cats = [
-      ...Array.from(el.getElementsByTagName("category")),
-      ...Array.from(el.getElementsByTagName("dc:subject")),
-    ]
-      .map((c) => (c.getAttribute("term") || c.textContent || "").trim())
-      .filter(Boolean);
-
-    const id =
-      el.querySelector("id")?.textContent ||
-      el.querySelector("guid")?.textContent ||
-      link || `${feedUrl}#${i}`;
-
-    return {
-      id,
-      title,
-      link: link || "",
-      published: publishedISO, // ISO UTC string
-      image: media || null,
-      source: domainFromURL(feedUrl),
-      description: rawDesc || undefined,
-      categories: cats.length ? cats : undefined,
-    };
-  });
-}
-
-
 
 async function fetchFeed(
   feedUrl: string,
@@ -495,562 +379,545 @@ async function fetchFeed(
   forceLocalTZ?: string,
   bust?: number
 ): Promise<FeedItem[]> {
-  
-  const key = cacheKey(feedUrl);
-  const skipCache = !!bust; // when busting, ignore localStorage cache
+  const params = new URLSearchParams({
+    u: feedUrl,
+    limit: String(FEED_ITEM_LIMIT),
+    b: String(bust ?? 0),
+  });
 
-  const cachedRaw = !skipCache && typeof window !== "undefined" ? localStorage.getItem(key) : null;
-  if (cachedRaw) {
-    try {
-      const cached = JSON.parse(cachedRaw) as { t: number; items: FeedItem[]; tz?: string | null };
-      // cache is still valid only if the same tz override applies
-      const sameTZ = (cached as any).tz === (forceLocalTZ || null);
-      if (Date.now() - cached.t < fifteenMinutes && sameTZ) return cached.items;
-    } catch {}
+  if (forceLocalTZ) params.set("tz", forceLocalTZ);
+
+  const response = await fetch(`/api/rss?${params.toString()}`, {
+    signal,
+    cache: "no-store",
+  });
+
+  if (!response.ok) {
+    logFeedHttpError(feedUrl, response.status);
+    const error = new Error(`HTTP ${response.status} for ${feedUrl}`) as Error & {
+      status?: number;
+      url?: string;
+    };
+    error.status = response.status;
+    error.url = feedUrl;
+    throw error;
   }
 
-  const resp = await fetch(
-    `/api/rss?u=${encodeURIComponent(feedUrl)}&b=${bust ?? 0}`,
-    { signal, cache: "no-store" }
+  const items = (await response.json()) as FeedItem[];
+  return items.map((item) => ({
+    ...item,
+    description: item.description ? sanitizeHtml(item.description, item.link || feedUrl) : undefined,
+  }));
+}
+
+async function runWithConcurrency<T>(
+  items: string[],
+  limit: number,
+  worker: (item: string) => Promise<T>
+): Promise<PromiseSettledResult<T>[]> {
+  const results: PromiseSettledResult<T>[] = new Array(items.length);
+  let nextIndex = 0;
+
+  async function runner() {
+    while (true) {
+      const current = nextIndex++;
+      if (current >= items.length) return;
+
+      try {
+        results[current] = {
+          status: "fulfilled",
+          value: await worker(items[current]),
+        };
+      } catch (reason) {
+        results[current] = {
+          status: "rejected",
+          reason,
+        };
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, () => runner())
   );
-  
-  if (!resp.ok) {
-  // record only 404/502 for pruning
-  logFeedHttpError(feedUrl, resp.status);
 
-  const err: any = new Error(`HTTP ${resp.status} for ${feedUrl}`);
-  err.status = resp.status;
-  err.url = feedUrl;
-  throw err;
-}
-  
-  if (!resp.ok) throw new Error(`Failed ${resp.status}`);
-  const xml = await resp.text();
-
-  // Pass override into parse; it will fix mislabelled Z→local
-  const items = parseRSS(xml, feedUrl, forceLocalTZ);
-
-if (!skipCache && typeof window !== "undefined") {
-     localStorage.setItem(key, JSON.stringify({ t: Date.now(), items, tz: forceLocalTZ || null }));
-  }
-  return items;
+  return results;
 }
 
-// ---------- component ----------
 export default function Page() {
   const { resolvedTheme, setTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
-  useEffect(() => setMounted(true), []);
-  
   const [bust, setBust] = useState(0);
+  const [config, setConfig] = useState<FeedsConfig | null>(null);
+  const [configError, setConfigError] = useState<string | null>(null);
+  const [active, setActive] = useState("");
+  const [viewMode, setViewMode] = useState<ViewMode>("grid4");
+  const [enabledFeeds, setEnabledFeeds] = useState<string[] | null>(null);
+  const [items, setItems] = useState<FeedItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<FeedItem | null>(null);
+  const requestIdRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
 
-// load runtime config (from /public/feeds.json)
-const [config, setConfig] = useState<FeedsConfig | null>(null);
-const [configError, setConfigError] = useState<string | null>(null);
+  useEffect(() => setMounted(true), []);
 
-useEffect(() => {
-  let cancelled = false;
-  (async () => {
+  useEffect(() => {
+    const syncEnabledFeeds = () => setEnabledFeeds(getEnabledFeeds());
+
+    syncEnabledFeeds();
+    window.addEventListener("storage", syncEnabledFeeds);
+    window.addEventListener("focus", syncEnabledFeeds);
+
+    return () => {
+      window.removeEventListener("storage", syncEnabledFeeds);
+      window.removeEventListener("focus", syncEnabledFeeds);
+    };
+  }, []);
+
+  useEffect(() => {
     try {
-      setConfigError(null);
-      const res = await fetch(`/feeds.json?b=${bust}`, { cache: "no-store" });
-      if (!res.ok) throw new Error(`Failed to load feeds.json (${res.status})`);
-      const json = (await res.json()) as FeedsConfig;
-      if (!cancelled) {
-        setConfig(json);
-        // helpful one-time visibility:
-        console.debug("feeds.json loaded", {
-          categories: json.categories.map(c => c.key),
-          photographyCount: (json.feeds?.photography || []).length,
-          photography: json.feeds?.photography
-        });
+      const stored =
+        typeof window !== "undefined"
+          ? localStorage.getItem(VIEW_MODE_KEY)
+          : null;
+      if (stored === "grid4" || stored === "list" || stored === "frontpage") {
+        setViewMode(stored);
       }
-    } catch (e: any) {
-      if (!cancelled) setConfigError(e?.message || "Failed to load feeds.json");
-    }
-  })();
-  return () => { cancelled = true; };
-}, [bust]);
-;
+    } catch {}
+  }, []);
 
-  // categories and feeds derived from config
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      try {
+        setConfigError(null);
+        const response = await fetch(`/feeds.json?b=${bust}`, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`Failed to load feeds.json (${response.status})`);
+        }
+
+        const json = (await response.json()) as FeedsConfig;
+        if (!cancelled) setConfig(json);
+      } catch (err) {
+        if (!cancelled) {
+          setConfigError(err instanceof Error ? err.message : "Failed to load feeds.json");
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [bust]);
+
   const categories = useMemo(() => {
     if (!config) return [] as FeedsConfig["categories"];
 
     const base = [...config.categories]
-      .filter((c) => c.enabled !== false)
+      .filter((category) => category.enabled !== false)
       .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
 
-    // Synthetic "All" item at the front (not in feeds.json)
-    const allCat = { key: "all", label: "All", emoji: "" };
-    return [allCat, ...base];
+    return [{ key: "all", label: "All", emoji: "" }, ...base];
   }, [config]);
 
-  const [active, setActive] = useState<string>("");
   useEffect(() => {
     if (!categories.length) return;
+
     const last =
       typeof window !== "undefined"
         ? localStorage.getItem("reader:lastCategory")
         : null;
+
     const initial =
-      last && categories.some((c) => c.key === last) ? last : categories[0].key;
+      last && categories.some((category) => category.key === last)
+        ? last
+        : categories[0].key;
+
     setActive(initial);
   }, [categories]);
 
   useEffect(() => {
-    if (active) localStorage.setItem("reader:lastCategory", active);
+    if (active) safeLocalStorageSetItem("reader:lastCategory", active);
   }, [active]);
 
-  // ⬇️ Scroll to top whenever the active category changes
+  useEffect(() => {
+    safeLocalStorageSetItem(VIEW_MODE_KEY, viewMode);
+  }, [viewMode]);
+
   useEffect(() => {
     if (!active) return;
     window.scrollTo({ top: 0, behavior: "smooth" });
   }, [active]);
 
-  {
-    /* const feedsForActive = useMemo(() => (config?.feeds[active] ?? []), [config, active]); */
-  }
   const feedsForActive = useMemo(() => {
     if (!config) return [];
 
     if (active === "all") {
-      // Use only *enabled* categories
-      const enabledKeys = (config.categories || [])
-        .filter((c) => c.enabled !== false)
-        .map((c) => c.key);
+      const enabledKeys = config.categories
+        .filter((category) => category.enabled !== false)
+        .map((category) => category.key);
 
-      const urls = enabledKeys.flatMap((k) => config.feeds[k] ?? []);
-      // De-dupe feed URLs to avoid duplicate fetches
-      return Array.from(new Set(urls));
+      const allFeeds = Array.from(new Set(enabledKeys.flatMap((key) => config.feeds[key] ?? [])));
+      return enabledFeeds ? allFeeds.filter((url) => enabledFeeds.includes(url)) : allFeeds;
     }
 
-    return config.feeds[active] ?? [];
-  }, [config, active]);
+    const categoryFeeds = config.feeds[active] ?? [];
+    return enabledFeeds ? categoryFeeds.filter((url) => enabledFeeds.includes(url)) : categoryFeeds;
+  }, [active, config, enabledFeeds]);
 
-  const [items, setItems] = useState<FeedItem[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<FeedItem | null>(null);
-  
+  useEffect(() => {
+    if (!active) return;
 
+    const loadCategory = async () => {
+      if (!feedsForActive.length) {
+        setItems([]);
+        setError(null);
+        return;
+      }
 
-  const requestIdRef = useRef(0);
-  const abortRef = useRef<AbortController | null>(null);
+      const myId = ++requestIdRef.current;
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
 
-async function loadCategory() {
-  if (!feedsForActive.length) {
-    setItems([]);
-    return;
-  }
+      setLoading(true);
+      setError(null);
+      setSelected(null);
 
- console.debug("Loading", active, "feeds:", feedsForActive);
+      const all = await runWithConcurrency(
+        feedsForActive,
+        FEED_CONCURRENCY,
+        (url) => fetchFeed(url, controller.signal, resolveTzOverride(url, config) || undefined, bust)
+      );
 
-  const myId = ++requestIdRef.current;
-  abortRef.current?.abort();
-  const controller = new AbortController();
-  abortRef.current = controller;
+      if (myId !== requestIdRef.current) return;
 
-  setLoading(true);
-  setError(null);
-  setSelected(null);
+      const failedFeeds = all.filter((result) => result.status === "rejected");
 
-  try {
-const all = await Promise.allSettled(
-  feedsForActive.map((u) => {
-    const tz = resolveTzOverride(u, config); // e.g., "Europe/Amsterdam" or null
-    return fetchFeed(u, controller.signal, tz || undefined, bust);
-  })
-);
-    if (myId !== requestIdRef.current) return;
+      const seenLinks = new Set<string>();
+      const seenTitles = new Set<string>();
+      const mergedWithTS = all
+        .flatMap((result) => (result.status === "fulfilled" ? result.value : []))
+        .filter((item) => {
+          const normalizedLink = item.link.trim();
+          if (normalizedLink) {
+            if (seenLinks.has(normalizedLink)) return false;
+            seenLinks.add(normalizedLink);
+          }
 
-    // Merge + de-dupe by link, compute numeric timestamp once
-    const mergedWithTS = all
-      .flatMap((r) => (r.status === "fulfilled" ? r.value : []))
-      .filter((v, i, arr) => v.link && arr.findIndex((x) => x.link === v.link) === i)
-      .map((it) => {
-        const ts = it.published ? Date.parse(it.published) : NaN; // published is ISO (Z) when parse succeeded
-        return { ...it, _ts: Number.isFinite(ts) ? ts : -Infinity }; // undated → bottom
-      })
-      // newest first; tie-break by link for stable order
-      .sort((a, b) => (b._ts - a._ts) || b.link.localeCompare(a.link));
-
-    // Age filter via numeric _ts (skip if maxAgeDays === 0)
-    const maxAgeDays = Math.max(0, config?.filters?.maxAgeDays ?? 7);
-    const ageCutoff = maxAgeDays > 0 ? Date.now() - maxAgeDays * 86_400_000 : null;
-    const ageFiltered = ageCutoff !== null
-      ? mergedWithTS.filter((it) => it._ts >= ageCutoff)
-      : mergedWithTS;
-
-    // Category blocklist (case-insensitive "contains")
-    const blockedLC = (config?.filters?.blockedCategories ?? []).map((s) => s.toLowerCase());
-    const finalItemsWithTS = blockedLC.length
-      ? ageFiltered.filter((it) => {
-          const cats = (it.categories || []).map((c) => c.toLowerCase());
-          return !blockedLC.some((b) => cats.some((c) => c.includes(b)));
+          const normalized = normalizeTitle(item.title);
+          if (!normalized) return true;
+          if (seenTitles.has(normalized)) return false;
+          seenTitles.add(normalized);
+          return true;
         })
-      : ageFiltered;
+        .map((item) => {
+          const timestamp = item.published ? Date.parse(item.published) : Number.NaN;
+          return { ...item, _ts: Number.isFinite(timestamp) ? timestamp : -Infinity };
+        })
+        .sort((a, b) => (b._ts - a._ts) || b.link.localeCompare(a.link));
 
-    // Strip helper field before setting state
-    setItems(finalItemsWithTS.map(({ _ts, ...it }) => it));
-  } catch (e: any) {
-    if (e?.name !== "AbortError") setError(e?.message || "Failed");
-  } finally {
-    if (myId === requestIdRef.current) setLoading(false);
-  }
-}
+      const maxAgeDays = Math.max(0, config?.filters?.maxAgeDays ?? 7);
+      const ageCutoff = maxAgeDays > 0 ? Date.now() - maxAgeDays * 86_400_000 : null;
+      const ageFiltered =
+        ageCutoff === null
+          ? mergedWithTS
+          : mergedWithTS.filter((item) => item._ts >= ageCutoff);
 
-const handleRefresh = async () => {
-  // 1) Best-effort: clear Cache Storage (if a SW/PWA is involved)
-  try {
-    if ("caches" in window) {
-      const names = await caches.keys();
-      await Promise.all(names.map((n) => caches.delete(n)));
-    }
-  } catch {}
+      const blocked = (config?.filters?.blockedCategories ?? []).map((value) => value.toLowerCase());
+      const filtered =
+        blocked.length === 0
+          ? ageFiltered
+          : ageFiltered.filter((item) => {
+              const categories = (item.categories || []).map((category) => category.toLowerCase());
+              return !blocked.some((entry) => categories.some((category) => category.includes(entry)));
+            });
 
-// 2) Clear any local/session storage your app uses
-try {
-  for (const k of Object.keys(localStorage)) {
-    if (
-      k.toLowerCase().includes("underwire") ||
-      k.toLowerCase().includes("feed") ||
-      k.startsWith("uw-") ||
-      k.startsWith("rsscache:")
-    ) {
-      localStorage.removeItem(k);
-    }
-  }
-  for (const k of Object.keys(sessionStorage)) {
-    if (
-      k.toLowerCase().includes("underwire") ||
-      k.toLowerCase().includes("feed") ||
-      k.startsWith("uw-") ||
-      k.startsWith("rsscache:")
-    ) {
-      sessionStorage.removeItem(k);
-    }
-  }
-} catch {}
+      setItems(filtered.map(({ _ts, ...item }) => item));
 
+      if (failedFeeds.length === feedsForActive.length) {
+        setError("Failed to load every feed in this category.");
+      } else if (failedFeeds.length > 0) {
+        setError(`Loaded with ${failedFeeds.length} feed failure${failedFeeds.length === 1 ? "" : "s"}.`);
+      }
 
-  setBust((n) => n + 1);
-};
+      setLoading(false);
+    };
 
-
-useEffect(() => {
-  if (active) loadCategory();
-}, [active, feedsForActive, bust]);
-
+    loadCategory().catch((err) => {
+      if (err instanceof Error && err.name === "AbortError") return;
+      setError(err instanceof Error ? err.message : "Failed");
+      setLoading(false);
+    });
+  }, [active, bust, config, feedsForActive]);
 
   useEffect(() => () => abortRef.current?.abort(), []);
 
   return (
-    <main className="max-w-7xl mx-auto px-3 pb-20">
-
-      <header className="sticky top-0 z-40 bg-white dark:bg-[#0b0b0e] border-b border-black/5 dark:border-white/10">
-        <div className="max-w-7xl mx-auto px-3 py-3 md:flex md:items-center md:gap-6">
-          {/* LEFT: logo + desktop categories */}
-          {/*<div className="flex items-center gap-4 min-w-0 flex-1">*/}
-          <div className="flex flex-col items-start gap-2 min-w-0 flex-1">
-            {/* logos */}
-            <img
-              src="/underwire_light.png"
-              alt="UNDERWIRE"
-              className="h-12 sm:h-14 md:h-16 w-auto dark:hidden"
-            />
-            <img
-              src="/underwire_dark.png"
-              alt="UNDERWIRE"
-              className="hidden dark:block h-12 sm:h-14 md:h-16 w-auto"
-            />
-
-            {/* desktop categories inline */}
-            {/*<nav className="hidden md:block min-w-0 overflow-x-auto">*/}
-              <nav className="hidden md:block w-full mt-1 overflow-x-auto">
-              <div className="inline-flex gap-1">
-                {categories.map((c) => (
-                  <button
-                    key={c.key}
-                    onClick={() => setActive(c.key)}
-                    aria-pressed={c.key === active}
-                    className={`px-3 py-1.5 rounded-md text-sm whitespace-nowrap transition ${
-                      c.key === active
-                        ? "bg-gray-900 text-white dark:bg-white dark:text-black"
-                        : "bg-gray-100 dark:bg-white/10 hover:bg-gray-200 dark:hover:bg-white/20"
-                    }`}
-                  >
-                    <span className="mr-1">{c.emoji}</span>
-                    {c.label}
-                  </button>
-                ))}
+    <main className="mx-auto max-w-7xl px-3 pb-24 pt-4 md:px-5">
+      <section className="surface-panel-strong relative overflow-hidden rounded-[2rem] px-4 py-5 md:px-8 md:py-7">
+        <div className="relative">
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+            <div className="max-w-3xl">
+              <div className="flex items-center gap-4">
+                <img
+                  src="/underwire_light.png"
+                  alt="UNDERWIRE"
+                  className="h-14 w-auto dark:hidden md:h-16"
+                />
+                <img
+                  src="/underwire_dark.png"
+                  alt="UNDERWIRE"
+                  className="hidden h-14 w-auto dark:block md:h-16"
+                />
               </div>
-            </nav>
-          </div>
-
-          {/* RIGHT: controls pinned top-right on desktop */}
-          <div className="hidden md:flex items-center gap-2 ml-auto self-center">
-
-<button
-  onClick={() => {
-    const bad = getBadFeeds(1);
-    if (bad.length) {
-      console.table(bad);
-      alert(`Printed ${bad.length} bad feeds to the console.\n(404/502 only)`);
-    } else {
-      alert("No bad feeds logged yet.");
-    }
-  }}
-  className="text-sm px-3 py-1.5 rounded-md bg-gray-100 dark:bg-white/10 hover:bg-gray-200 dark:hover:bg-white/20"
->
-  Bad feeds
-</button>
-
-
-<button
-  onClick={handleRefresh}
-   className="text-sm px-3 py-1.5 rounded-md bg-gray-100 dark:bg-white/10 text-gray-900 dark:text-white hover:bg-gray-200 dark:hover:bg-white/20"
->
-  Refresh
-</button>
-            {mounted && (
-              <button
-                onClick={() =>
-                  setTheme(resolvedTheme === "dark" ? "light" : "dark")
-                }
-                className="text-sm px-3 py-1.5 rounded-md bg-gray-100 dark:bg-white/10 text-gray-900 dark:text-white hover:bg-gray-200 dark:hover:bg-white/20"
-                aria-label="Toggle theme"
-                title={`Switch to ${
-                  resolvedTheme === "dark" ? "light" : "dark"
-                } mode`}
-              >
-                {resolvedTheme === "dark" ? "🌞" : "🌙"}
-              </button>
-            )}
-          </div>
-
-          {/* MOBILE: categories on second row */}
-          <nav className="md:hidden w-full mt-2">
-            <div className="flex flex-wrap gap-0.5">
-              {categories.map((c) => (
-                <button
-                  key={c.key}
-                  onClick={() => setActive(c.key)}
-                  aria-pressed={c.key === active}
-                  className={`px-1.5 py-0.5 rounded-md text-xs leading-4 transition ${
-                    c.key === active
-                      ? "bg-gray-900 text-white dark:bg-white dark:text-black"
-                      : "bg-gray-100 dark:bg-white/10 hover:bg-gray-200 dark:hover:bg-white/20"
-                  }`}
-                >
-                  <span className="mr-0.5">{c.emoji}</span>
-                  {c.label}
-                </button>
-              ))}
             </div>
-          </nav>
-        </div>
-      </header>
+          </div>
 
-      {/* Config loading / error */}
+          <div className="mt-5 flex flex-col gap-3 border-t border-[var(--border)] pt-4">
+            <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+              <nav className="overflow-x-auto">
+                <div className="inline-flex gap-2 pb-1">
+                  {categories.map((category) => (
+                    <button
+                      key={category.key}
+                      onClick={() => setActive(category.key)}
+                      aria-pressed={category.key === active}
+                      className={`font-ui px-3 py-1.5 text-xs transition ${
+                        category.key === active
+                          ? "theme-button-active"
+                          : "theme-button"
+                      }`}
+                    >
+                      <span className="mr-1.5">{category.emoji}</span>
+                      {category.label}
+                    </button>
+                  ))}
+                </div>
+              </nav>
+
+              <div className="flex flex-wrap gap-2">
+                <div className="flex border border-[var(--border)]">
+                  {(["grid4", "list", "frontpage"] as ViewMode[]).map((mode) => {
+                    const activeMode = viewMode === mode;
+                    return (
+                      <button
+                        key={mode}
+                        type="button"
+                        onClick={() => setViewMode(mode)}
+                        aria-pressed={activeMode}
+                        title={
+                          mode === "grid4"
+                            ? "Dense grid"
+                            : mode === "list"
+                              ? "List view"
+                              : "Newspaper front page"
+                        }
+                        className={`flex items-center justify-center border-r border-[var(--border)] px-3 py-1.5 text-xs last:border-r-0 ${
+                          activeMode
+                            ? "theme-button-active"
+                            : "theme-button"
+                        }`}
+                      >
+                        <ViewIcon mode={mode} active={activeMode} />
+                      </button>
+                    );
+                  })}
+                </div>
+                <Link
+                  href="/feeds"
+                  className="theme-button inline-flex items-center justify-center px-3 py-1.5 text-xs transition"
+                  aria-label="Manage feeds"
+                  title="Manage feeds"
+                >
+                  <ActionIcon kind="feeds" />
+                </Link>
+                <button
+                  onClick={() => {
+                    const bad = getBadFeeds(1);
+                    if (bad.length) {
+                      console.table(bad);
+                      alert(`Printed ${bad.length} bad feeds to the console.\n(404/502 only)`);
+                    } else {
+                      alert("No bad feeds logged yet.");
+                    }
+                  }}
+                  className="theme-button inline-flex items-center justify-center px-3 py-1.5 text-xs transition"
+                  aria-label="Feed health"
+                  title="Feed health"
+                >
+                  <ActionIcon kind="health" />
+                </button>
+                <button
+                  onClick={() => setBust((value) => value + 1)}
+                  className="theme-button inline-flex items-center justify-center px-3 py-1.5 text-xs transition"
+                  aria-label="Refresh"
+                  title="Refresh"
+                >
+                  <ActionIcon kind="refresh" />
+                </button>
+                {mounted && (
+                  <button
+                    onClick={() => setTheme(resolvedTheme === "dark" ? "light" : "dark")}
+                    className="theme-button inline-flex items-center justify-center px-3 py-1.5 text-xs transition"
+                    aria-label="Toggle theme"
+                    title={`Switch to ${resolvedTheme === "dark" ? "light" : "dark"} mode`}
+                  >
+                    <ActionIcon kind="theme" />
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
       {!config && !configError && (
-        <p className="mt-4 text-sm opacity-70">Loading sources…</p>
+        <div className="surface-panel mt-6 rounded-[1.75rem] px-5 py-4 text-sm muted-text">
+          Loading sources…
+        </div>
       )}
       {configError && (
-        <p className="mt-4 text-sm text-red-600 dark:text-red-400">
+        <div className="surface-panel mt-6 rounded-[1.75rem] px-5 py-4 text-sm">
           {configError}
-        </p>
+        </div>
       )}
 
-      {/* Two-column layout: list + conditional details */}
       {config && (
-        <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
-          {/* LIST */}
-          <div className="md:col-span-3">
-            {loading && (
-              <p className="mt-2 text-sm opacity-70">
-                Loading {categories.find((c) => c.key === active)?.label}…
-              </p>
-            )}
-            {error && (
-              <p className="mt-2 text-sm text-red-600 dark:text-red-400">
-                {error}
-              </p>
-            )}
+        <section className="mt-6">
+          {loading && (
+            <div className="surface-panel mb-4 rounded-[1.5rem] px-5 py-4 text-sm muted-text">
+              Loading {categories.find((category) => category.key === active)?.label}…
+            </div>
+          )}
+          {!loading && !error && !items.length && (
+            <div className="surface-panel mb-4 rounded-[1.5rem] px-5 py-5 text-sm muted-text">
+              No articles are available right now. Review your source selections on{" "}
+              <Link href="/feeds" className="underline underline-offset-4">
+                the feeds page
+              </Link>
+              .
+            </div>
+          )}
 
-            <ul className="mt-2 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
-              {items.map((it) => {
-                const hasGoodImg = !isBadImage(it.image);
-                const showImg = !isBadImage(it.image) ? (it.image as string) : null;
-                const isSelected = selected?.id === it.id;
+          {viewMode === "frontpage" ? (
+            <NewspaperFrontPage
+              items={items}
+              onOpen={setSelected}
+            />
+          ) : (
+            <ul
+              className={`grid gap-4 ${
+                viewMode === "list"
+                  ? "grid-cols-1"
+                  : "grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4"
+              }`}
+            >
+              {items.map((item) => {
+                const showImg = !isBadImage(item.image) ? item.image : null;
+                const isSelected = selected?.id === item.id;
 
                 return (
                   <li
-                    key={it.id}
-                    className="group rounded-xl border border-black/5 dark:border-white/10 bg-white/60 dark:bg-white/5 hover:bg-white/80 dark:hover:bg-white/10 transition cursor-pointer"
-                    onClick={() => setSelected(it)}
+                    key={item.id}
+                    className={`surface-panel group overflow-hidden rounded-[1.75rem] transition duration-300 ${
+                      isSelected ? "ring-1 ring-[var(--foreground)]" : "hover:-translate-y-0.5"
+                    }`}
                   >
-                    {/* Image area */}
-                    {showImg ? (
-                      <button
-                        type="button"
-                        onClick={() => setSelected(it)}
-                        className="block w-full"
-                        aria-label={`Preview: ${it.title}`}
-                      >
-                        <div className="relative w-full">
-                          <div className="aspect-[16/9] overflow-hidden rounded-2xl bg-gray-100 dark:bg-white/10">
-                            {/* eslint-disable-next-line @next/next/no-img-element */}
-                            <img
-                              src={showImg}
-                              alt=""
-                              loading="lazy"
-                              className="h-full w-full object-cover"
-                            />
-                          </div>
-                          {/* Square-corner overlay aligned left, full width */}
-                          <div className="absolute inset-x-0 bottom-0">
-                            <div className="bg-black/45 backdrop-blur px-3 py-2 text-white text-sm leading-snug text-left rounded-none">
-                              <span className="block whitespace-normal break-words [overflow-wrap:anywhere]">
-                                {it.title}
-                              </span>
-                            </div>
-                          </div>
-                        </div>
-                      </button>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => setSelected(it)}
-                        className="block w-full"
-                        aria-label={`Preview: ${it.title}`}
-                      >
-                        <div className="relative w-full">
-                          <div className="aspect-[16/9] bg-gray-100 dark:bg-white/10" />
-                          <div className="absolute inset-x-0 bottom-0">
-                            <div className="bg-black/45 backdrop-blur px-3 py-2 text-white text-sm leading-snug text-left rounded-none">
-                              <span className="block whitespace-normal break-words [overflow-wrap:anywhere]">
-                                {it.title}
-                              </span>
-                            </div>
-                          </div>
-                        </div>
-                      </button>
-                    )}
-
-                    <div className="p-3 text-xs">
-                      <div className="flex items-center justify-between gap-3 text-xs">
-                        <div className="min-w-0">
-                          <div className="opacity-70 truncate">
-                            {domainFromURL(it.link || it.source)}
-                          </div>
-
-                          {Array.isArray(it.categories) &&
-                            it.categories.length > 0 && (
-                              <div
-                                className="opacity-60 truncate mt-0.5"
-                                title={it.categories.join(", ")}
-                              >
-                                {it.categories.join(", ")}
+                    <button
+                      type="button"
+                      onClick={() => setSelected(item)}
+                      className="block w-full text-left"
+                      aria-label={`Preview: ${item.title}`}
+                    >
+                      <div className={viewMode === "list" ? "flex flex-col md:flex-row" : ""}>
+                        <div className={`relative ${viewMode === "list" ? "md:w-[18rem] md:min-w-[18rem]" : ""}`}>
+                          <div className={`overflow-hidden bg-[var(--background-alt)] ${viewMode === "list" ? "aspect-[16/10] md:h-full md:min-h-[12rem] md:aspect-auto" : "aspect-[16/10]"}`}>
+                            {showImg ? (
+                              <img
+                                src={showImg}
+                                alt=""
+                                loading="lazy"
+                                className="h-full w-full object-cover transition duration-500 group-hover:scale-[1.03]"
+                              />
+                            ) : (
+                              <div className="flex h-full items-end bg-[var(--background-alt)] p-5">
+                                <div className="font-mono muted-text text-xs uppercase tracking-[0.24em]">
+                                  {domainFromURL(item.link || item.source)}
+                                </div>
                               </div>
                             )}
+                          </div>
                         </div>
 
-{it.published && (
-  <time
-    className="opacity-60 whitespace-nowrap"
-    dateTime={it.published}
-    title={formatInTZ(it.published, {
-      year: "numeric", month: "2-digit", day: "2-digit",
-      hour: "2-digit", minute: "2-digit", second: "2-digit",
-      timeZoneName: "short",
-      timeZone: TARGET_TZ,              // ← override display TZ here
-    })}
-  >
-    {timeAgo(it.published)}
-  </time>
-)}
-                      </div>
+                        <div className={`p-5 ${viewMode === "list" ? "flex min-w-0 flex-1 flex-col" : "flex min-h-[15rem] flex-col"}`}>
+                          <div className="flex-1">
+                            <h3
+                              className={`font-display leading-tight ${
+                                viewMode === "grid4"
+                                  ? "mt-1 text-[1.08rem] md:text-[1.15rem]"
+                                  : viewMode === "list"
+                                    ? "mt-0 text-[1.2rem] md:text-[1.35rem]"
+                                    : "mt-2 text-[1.25rem] md:text-[1.35rem]"
+                              }`}
+                            >
+                              {item.title}
+                            </h3>
 
-                      {/* Show external link only when selected */}
-                      <div className={`mt-2 ${isSelected ? "" : "hidden"}`}>
-                        <a
-                          className="text-xs opacity-70 hover:opacity-100 underline"
-                          href={it.link}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                        >
-                          Open article ↗
-                        </a>
+                            {Array.isArray(item.categories) && item.categories.length > 0 && (
+                              <div className="mt-4 flex flex-wrap gap-2">
+                                {item.categories.slice(0, viewMode === "grid4" ? 2 : 3).map((category) => (
+                                  <span
+                                    key={`${item.id}-${category}`}
+                                    className="accent-chip px-2.5 py-1 text-[11px]"
+                                    title={category}
+                                  >
+                                    {category}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="mt-5">
+                            {isSelected && (
+                              <div className="mb-2 text-right text-xs muted-text">
+                                Reading now
+                              </div>
+                            )}
+                            <div className="flex items-end justify-between gap-3 text-[10px]">
+                              <span className="font-mono uppercase tracking-[0.16em]">
+                                {domainFromURL(item.link || item.source)}
+                              </span>
+                              {item.published && (
+                                <time
+                                  className="font-mono"
+                                  dateTime={item.published}
+                                  title={formatAbsoluteTimestamp(item.published)}
+                                >
+                                  {timeAgo(item.published)}
+                                </time>
+                              )}
+                            </div>
+                          </div>
+                        </div>
                       </div>
-                    </div>
+                    </button>
                   </li>
                 );
               })}
             </ul>
-          </div>
-        </div>
+          )}
+        </section>
       )}
+
       <DetailsSheet
         open={!!selected}
         onClose={() => setSelected(null)}
         item={selected}
       />
     </main>
-  );
-}
-
-function ArticlePanel({
-  item,
-  onClose,
-}: {
-  item: FeedItem;
-  onClose: () => void;
-}) {
-  const hasGoodImg = !isBadImage(item.image);
-  const showImg = !isBadImage(item.image) ? (item.image as string) : null;
-
-  return (
-    <div className="p-4">
-      <div className="flex items-start gap-2">
-        <h2
-          id="article-title"
-          className="text-base font-semibold leading-snug flex-1"
-        >
-          {item.title}
-        </h2>
-        <button
-          onClick={onClose}
-          className="text-xs px-2 py-1 rounded bg-gray-100 dark:bg-white/10 hover:bg-gray-200 dark:hover:bg-white/20"
-          aria-label="Close preview"
-        >
-          Close ✕
-        </button>
-      </div>
-
-      <div className="mt-4 text-xs opacity-60">{domainFromURL(item.link)}</div>
-
-      <div className="mt-3 aspect-[16/9] overflow-hidden rounded bg-gray-100 dark:bg-white/10">
-        {showImg ? (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img src={showImg} alt="" className="w-full h-full object-cover" />
-        ) : null}
-      </div>
-
-// DetailsPanel — replace the published block
-{item.published && (() => {
-  const abs = formatInTZ(item.published, {
-    year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit",
-    timeZoneName: "short",
-    timeZone: TARGET_TZ,
-  });
-  return (
-    <div className="mt-2 text-xs opacity-60" title={abs}>
-      {abs} · {timeAgo(item.published)}
-    </div>
-  );
-})()}
-    </div>
   );
 }

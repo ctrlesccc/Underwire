@@ -1,24 +1,36 @@
 import "./globals.css";
-
+import { Fraunces, Manrope, Space_Mono } from "next/font/google";
+import packageJson from "../package.json";
 
 import { ThemeProvider } from "../components/theme-provider";
 
 export const metadata = { title: "UNDERWIRE", description: "UNDERWIRE" };
 
+const display = Fraunces({
+  subsets: ["latin"],
+  variable: "--font-display",
+});
+
+const body = Manrope({
+  subsets: ["latin"],
+  variable: "--font-body",
+});
+
+const mono = Space_Mono({
+  subsets: ["latin"],
+  weight: ["400", "700"],
+  variable: "--font-mono",
+});
+
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com" />
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
-        <link
-          href="https://fonts.googleapis.com/css2?family=Roboto+Mono:ital,wght@0,100..700;1,100..700&display=swap"
-          rel="stylesheet"
-        />
-      </head>
-      <body className="min-h-dvh bg-white text-gray-900 dark:bg-[#0b0b0e] dark:text-gray-100">
+      <body className={`${display.variable} ${body.variable} ${mono.variable} min-h-dvh relative`}>
         <ThemeProvider attribute="class" defaultTheme="system" enableSystem>
           {children}
+          <div className="pointer-events-none fixed bottom-2 right-3 z-[60] font-mono text-[10px] uppercase tracking-[0.16em] muted-text">
+            v{packageJson.version}
+          </div>
         </ThemeProvider>
       </body>
     </html>
